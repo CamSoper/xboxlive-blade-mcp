@@ -10,11 +10,11 @@ import json
 import logging
 from typing import Any
 
-import aiohttp
 from xbox.webapi.api.client import XboxLiveClient
 from xbox.webapi.api.provider.catalog.models import AlternateIdType
 from xbox.webapi.authentication.manager import AuthenticationManager
 from xbox.webapi.authentication.models import OAuth2TokenResponse
+from xbox.webapi.common.signed_session import SignedSession
 
 from xboxlive_blade_mcp.models import (
     get_client_id,
@@ -120,7 +120,7 @@ class XboxClient:
     def __init__(self) -> None:
         self._auth_mgr: AuthenticationManager | None = None
         self._xbl: XboxLiveClient | None = None
-        self._session: aiohttp.ClientSession | None = None
+        self._session: SignedSession | None = None
 
     async def _ensure_auth(self) -> XboxLiveClient:
         """Ensure we have valid auth and return the XboxLiveClient."""
@@ -130,7 +130,7 @@ class XboxClient:
         client_id = get_client_id()
         client_secret = get_client_secret()
 
-        self._session = aiohttp.ClientSession()
+        self._session = SignedSession()
         self._auth_mgr = AuthenticationManager(
             self._session, client_id, client_secret, REDIRECT_URI
         )
@@ -718,5 +718,5 @@ class XboxClient:
 
     async def close(self) -> None:
         """Close the underlying HTTP session."""
-        if self._session and not self._session.closed:
-            await self._session.close()
+        if self._session and not self._session.is_closed:
+            await self._session.aclose()
