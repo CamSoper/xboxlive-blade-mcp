@@ -14,6 +14,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 from urllib.parse import parse_qs, urlparse
 
+import aiohttp
 from xbox.webapi.authentication.manager import AuthenticationManager
 
 from xboxlive_blade_mcp.models import get_client_id, get_client_secret, get_token_path
@@ -66,45 +67,46 @@ async def authenticate() -> None:
     client_id = get_client_id()
     client_secret = get_client_secret()
 
-    auth_mgr = AuthenticationManager(client_id, client_secret, REDIRECT_URI)
+    async with aiohttp.ClientSession() as session:
+        auth_mgr = AuthenticationManager(session, client_id, client_secret, REDIRECT_URI)
 
-    # Generate auth URL
-    auth_url = auth_mgr.generate_authorization_url()
+        # Generate auth URL
+        auth_url = auth_mgr.generate_authorization_url()
 
-    print("\n=== Xbox Live Authentication ===\n")
-    print("Opening browser for Microsoft account login...")
-    print(f"If the browser doesn't open, visit:\n{auth_url}\n")
+        print("\n=== Xbox Live Authentication ===\n")
+        print("Opening browser for Microsoft account login...")
+        print(f"If the browser doesn't open, visit:\n{auth_url}\n")
 
-    webbrowser.open(auth_url)
+        webbrowser.open(auth_url)
 
-    # Start local server to catch redirect
-    _CallbackHandler.auth_code = None
-    server = HTTPServer(("localhost", AUTH_PORT), _CallbackHandler)
-    server_thread = Thread(target=server.handle_request, daemon=True)
-    server_thread.start()
+        # Start local server to catch redirect
+        _CallbackHandler.auth_code = None
+        server = HTTPServer(("localhost", AUTH_PORT), _CallbackHandler)
+        server_thread = Thread(target=server.handle_request, daemon=True)
+        server_thread.start()
 
-    print(f"Waiting for redirect on http://localhost:{AUTH_PORT}/auth/callback ...")
-    server_thread.join(timeout=120)
-    server.server_close()
+        print(f"Waiting for redirect on http://localhost:{AUTH_PORT}/auth/callback ...")
+        server_thread.join(timeout=120)
+        server.server_close()
 
-    code = _CallbackHandler.auth_code
-    if not code:
-        print("\nError: No authorization code received. Timed out or cancelled.")
-        sys.exit(1)
+        code = _CallbackHandler.auth_code
+        if not code:
+            print("\nError: No authorization code received. Timed out or cancelled.")
+            sys.exit(1)
 
-    print("Authorization code received. Exchanging for tokens...")
+        print("Authorization code received. Exchanging for tokens...")
 
-    try:
-        await auth_mgr.request_tokens(code)
-    except Exception as e:
-        print(f"\nError: Token exchange failed: {e}")
-        sys.exit(1)
+        try:
+            await auth_mgr.request_tokens(code)
+        except Exception as e:
+            print(f"\nError: Token exchange failed: {e}")
+            sys.exit(1)
 
-    # Save tokens
-    token_path = get_token_path()
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(auth_mgr.oauth.model_dump_json(indent=2))
-    token_path.chmod(0o600)
+        # Save tokens
+        token_path = get_token_path()
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(auth_mgr.oauth.model_dump_json(indent=2))
+        token_path.chmod(0o600)
 
     print(f"\nTokens saved to {token_path}")
     print("Authentication complete! The MCP server can now connect to Xbox Live.")
