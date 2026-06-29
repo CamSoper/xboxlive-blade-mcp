@@ -14,8 +14,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from threading import Thread
 from urllib.parse import parse_qs, urlparse
 
-import aiohttp
 from xbox.webapi.authentication.manager import AuthenticationManager
+from xbox.webapi.common.signed_session import SignedSession
 
 from xboxlive_blade_mcp.models import get_client_id, get_client_secret, get_token_path
 
@@ -67,7 +67,7 @@ async def authenticate() -> None:
     client_id = get_client_id()
     client_secret = get_client_secret()
 
-    async with aiohttp.ClientSession() as session:
+    async with SignedSession() as session:
         auth_mgr = AuthenticationManager(session, client_id, client_secret, REDIRECT_URI)
 
         # Generate auth URL
