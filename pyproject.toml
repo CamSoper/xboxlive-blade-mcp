@@ -1,6 +1,6 @@
 [project]
 name = "xboxlive-blade-mcp"
-version = "0.2.2"
+version = "0.2.3"
 description = "Xbox Live MCP Server — profiles, achievements, friends, presence, Game Pass, SmartGlass console control"
 readme = "README.md"
 license = {text = "MIT"}

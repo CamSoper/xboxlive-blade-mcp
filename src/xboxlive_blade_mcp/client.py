@@ -12,6 +12,7 @@ from typing import Any
 
 from xbox.webapi.api.client import XboxLiveClient
 from xbox.webapi.api.provider.catalog.models import AlternateIdType
+from xbox.webapi.api.provider.smartglass.models import VolumeDirection
 from xbox.webapi.authentication.manager import AuthenticationManager
 from xbox.webapi.authentication.models import OAuth2TokenResponse
 from xbox.webapi.common.signed_session import SignedSession
@@ -168,9 +169,7 @@ class XboxClient:
         """Health check: auth status, gamertag, token expiry."""
         try:
             xbl = await self._ensure_auth()
-            profile = await xbl.profile.get_profile_by_xuid(
-                xbl.xuid, ["GameDisplayName", "Gamerscore", "GameDisplayPicRaw"]
-            )
+            profile = await xbl.profile.get_profile_by_xuid(str(xbl.xuid))
             settings = {}
             if profile and profile.profile_users:
                 for s in profile.profile_users[0].settings:
@@ -178,7 +177,8 @@ class XboxClient:
             result: dict[str, Any] = {
                 "authenticated": True,
                 "xuid": str(xbl.xuid),
-                "gamertag": settings.get("GameDisplayName", "unknown"),
+                "gamertag": settings.get("Gamertag")
+                or settings.get("GameDisplayName", "unknown"),
             }
             if self._auth_mgr and self._auth_mgr.oauth:
                 result["token_expires"] = str(
@@ -202,17 +202,14 @@ class XboxClient:
         """Get user profile by gamertag or XUID."""
         xbl = await self._ensure_auth()
         try:
-            settings_list = [
-                "GameDisplayName", "Gamerscore", "GameDisplayPicRaw",
-                "AccountTier", "TenureLevel", "PreferredColor",
-                "RealName", "Bio", "Watermarks",
-            ]
+            # xbox-webapi 2.x requests a fixed, comprehensive settings list
+            # internally; the caller no longer passes one.
             if gamertag:
                 resp = await xbl.profile.get_profile_by_gamertag(gamertag)
             elif xuid:
-                resp = await xbl.profile.get_profile_by_xuid(xuid, settings_list)
+                resp = await xbl.profile.get_profile_by_xuid(xuid)
             else:
-                resp = await xbl.profile.get_profile_by_xuid(xbl.xuid, settings_list)
+                resp = await xbl.profile.get_profile_by_xuid(str(xbl.xuid))
 
             if not resp or not resp.profile_users:
                 raise NotFoundError(f"Profile not found: {gamertag or xuid or 'self'}")
@@ -221,12 +218,12 @@ class XboxClient:
             settings = {s.id: s.value for s in user.settings}
             return {
                 "xuid": str(user.id),
-                "gamertag": settings.get("GameDisplayName", ""),
+                "gamertag": settings.get("Gamertag", settings.get("GameDisplayName", "")),
                 "gamerscore": settings.get("Gamerscore", ""),
                 "account_tier": settings.get("AccountTier", ""),
                 "tenure_level": settings.get("TenureLevel", ""),
                 "preferred_color": settings.get("PreferredColor", ""),
-                "real_name": settings.get("RealName", ""),
+                "real_name": settings.get("RealNameOverride", settings.get("RealName", "")),
                 "bio": settings.get("Bio", ""),
             }
         except XboxError:
@@ -260,12 +257,20 @@ class XboxClient:
             achievements = []
             if resp and resp.achievements:
                 for a in resp.achievements[:limit]:
+                    # rewards is a list of Reward model objects (not dicts);
+                    # the Gamerscore reward carries the point value.
+                    gamerscore = 0
+                    for rw in (getattr(a, "rewards", None) or []):
+                        if getattr(rw, "type", "") == "Gamerscore":
+                            try:
+                                gamerscore = int(rw.value)
+                            except (TypeError, ValueError):
+                                gamerscore = 0
+                            break
                     item: dict[str, Any] = {
                         "name": a.name,
                         "description": getattr(a, "description", ""),
-                        "gamerscore": getattr(a, "rewards", [{}])[0].get("value", 0)
-                        if getattr(a, "rewards", None)
-                        else 0,
+                        "gamerscore": gamerscore,
                         "earned": a.progress_state == "Achieved",
                     }
                     if a.progression and a.progression.time_unlocked:
@@ -288,9 +293,7 @@ class XboxClient:
         xbl = await self._ensure_auth()
         target_xuid = xuid or str(xbl.xuid)
         try:
-            profile = await xbl.profile.get_profile_by_xuid(
-                target_xuid, ["Gamerscore", "GameDisplayName"]
-            )
+            profile = await xbl.profile.get_profile_by_xuid(target_xuid)
             settings = {}
             if profile and profile.profile_users:
                 settings = {s.id: s.value for s in profile.profile_users[0].settings}
@@ -423,17 +426,28 @@ class XboxClient:
         """Search for users by gamertag."""
         xbl = await self._ensure_auth()
         try:
-            resp = await xbl.usersearch.get_live_search(query)
+            # Bypass the typed provider: xbox-webapi 2.1.0's UserSearchResponse
+            # requires a non-null `text`, but the /suggest endpoint returns null
+            # for some entries. Parse the JSON directly.
+            us = xbl.usersearch
+            resp = await xbl.session.get(
+                us.USERSEARCH_URL + "/suggest",
+                params={"q": query},
+                headers=us.HEADERS_USER_SEARCH,
+            )
+            resp.raise_for_status()
+            data = resp.json()
             results = []
-            if resp and resp.results:
-                for r in resp.results[:limit]:
-                    item: dict[str, Any] = {
-                        "gamertag": getattr(r, "gamertag", "?"),
-                        "xuid": str(getattr(r, "xuid", "")),
-                    }
-                    if hasattr(r, "gamerscore"):
-                        item["gamerscore"] = r.gamerscore
-                    results.append(item)
+            for r in (data.get("results") or [])[:limit]:
+                inner = r.get("result") or {}
+                gamertag = inner.get("gamertag") or r.get("text")
+                xuid = inner.get("id") or ""
+                if not gamertag and not xuid:
+                    continue
+                results.append({
+                    "gamertag": gamertag or "?",
+                    "xuid": str(xuid),
+                })
             return results
         except XboxError:
             raise
@@ -471,7 +485,9 @@ class XboxClient:
         """Send a message to one or more users."""
         xbl = await self._ensure_auth()
         try:
-            await xbl.message.send_message(xuids, message_text)
+            # 2.x send_message targets a single xuid; fan out to each recipient.
+            for x in xuids:
+                await xbl.message.send_message(x, message_text)
             return {"status": "sent", "recipients": len(xuids)}
         except XboxError:
             raise
@@ -489,23 +505,32 @@ class XboxClient:
         xbl = await self._ensure_auth()
         target_xuid = xuid or str(xbl.xuid)
         try:
+            # Bypass the typed provider: xbox-webapi 2.1.0's GameclipsResponse
+            # rejects real API data (e.g. integer `state`). Parse JSON directly.
+            gc = xbl.gameclips
+            url = gc.GAMECLIPS_METADATA_URL + f"/users/xuid({target_xuid})"
             if title_id:
-                resp = await xbl.gameclips.get_recent_community_clips_by_title_id(title_id)
-            else:
-                resp = await xbl.gameclips.get_recent_own_clips(target_xuid)
+                url += f"/titles/{title_id}"
+            url += "/clips"
+            resp = await xbl.session.get(
+                url,
+                params={"skipItems": 0, "maxItems": limit},
+                headers=gc.HEADERS_GAMECLIPS_METADATA,
+            )
+            resp.raise_for_status()
             clips = []
-            if resp and resp.game_clips:
-                for c in resp.game_clips[:limit]:
-                    item: dict[str, Any] = {
-                        "title_name": getattr(c, "title_name", "?"),
-                        "clip_id": getattr(c, "game_clip_id", ""),
-                        "date_recorded": str(getattr(c, "date_recorded", "")),
-                        "duration_seconds": getattr(c, "duration_in_seconds", 0),
-                        "views": getattr(c, "views", 0),
-                    }
-                    if hasattr(c, "game_clip_uris") and c.game_clip_uris:
-                        item["uri"] = c.game_clip_uris[0].uri
-                    clips.append(item)
+            for c in (resp.json().get("gameClips") or [])[:limit]:
+                item: dict[str, Any] = {
+                    "title_name": c.get("titleName", "?"),
+                    "clip_id": c.get("gameClipId", ""),
+                    "date_recorded": str(c.get("dateRecorded", "")),
+                    "duration_seconds": c.get("durationInSeconds", 0),
+                    "views": c.get("views", 0),
+                }
+                uris = c.get("gameClipUris") or []
+                if uris:
+                    item["uri"] = uris[0].get("uri")
+                clips.append(item)
             return clips
         except XboxError:
             raise
@@ -519,22 +544,31 @@ class XboxClient:
         xbl = await self._ensure_auth()
         target_xuid = xuid or str(xbl.xuid)
         try:
+            # Bypass the typed provider: xbox-webapi 2.1.0's ScreenshotResponse
+            # rejects real API data (e.g. integer `state`). Parse JSON directly.
+            ss = xbl.screenshots
+            url = ss.SCREENSHOTS_METADATA_URL + f"/users/xuid({target_xuid})"
             if title_id:
-                resp = await xbl.screenshots.get_recent_community_screenshots_by_title_id(title_id)
-            else:
-                resp = await xbl.screenshots.get_recent_own_screenshots(target_xuid)
+                url += f"/titles/{title_id}"
+            url += "/screenshots"
+            resp = await xbl.session.get(
+                url,
+                params={"skipItems": 0, "maxItems": limit},
+                headers=ss.HEADERS_SCREENSHOTS_METADATA,
+            )
+            resp.raise_for_status()
             screenshots = []
-            if resp and resp.screenshots:
-                for s in resp.screenshots[:limit]:
-                    item: dict[str, Any] = {
-                        "title_name": getattr(s, "title_name", "?"),
-                        "screenshot_id": getattr(s, "screenshot_id", ""),
-                        "date_taken": str(getattr(s, "date_taken", "")),
-                        "views": getattr(s, "views", 0),
-                    }
-                    if hasattr(s, "screenshot_uris") and s.screenshot_uris:
-                        item["uri"] = s.screenshot_uris[0].uri
-                    screenshots.append(item)
+            for s in (resp.json().get("screenshots") or [])[:limit]:
+                item: dict[str, Any] = {
+                    "title_name": s.get("titleName", "?"),
+                    "screenshot_id": s.get("screenshotId", ""),
+                    "date_taken": str(s.get("dateTaken", "")),
+                    "views": s.get("views", 0),
+                }
+                uris = s.get("screenshotUris") or []
+                if uris:
+                    item["uri"] = uris[0].get("uri")
+                screenshots.append(item)
             return screenshots
         except XboxError:
             raise
@@ -574,18 +608,20 @@ class XboxClient:
         xbl = await self._ensure_auth()
         try:
             sg = xbl.smartglass
+            # xbox-webapi 2.x exposes discrete SmartGlass methods rather than a
+            # single command(category, action) entry point.
             cmd_map: dict[str, Any] = {
-                "power_off": lambda: sg.command(console_id, "Power", "TurnOff"),
-                "power_on": lambda: sg.command(console_id, "Power", "TurnOn"),
-                "reboot": lambda: sg.command(console_id, "Power", "Reboot"),
-                "mute": lambda: sg.command(console_id, "Audio", "Mute"),
-                "unmute": lambda: sg.command(console_id, "Audio", "Unmute"),
-                "volume_up": lambda: sg.command(console_id, "Audio", "VolumeUp"),
-                "volume_down": lambda: sg.command(console_id, "Audio", "VolumeDown"),
-                "play": lambda: sg.command(console_id, "Media", "Play"),
-                "pause": lambda: sg.command(console_id, "Media", "Pause"),
-                "go_home": lambda: sg.command(console_id, "Shell", "GoHome"),
-                "go_back": lambda: sg.command(console_id, "Shell", "GoBack"),
+                "power_off": lambda: sg.turn_off(console_id),
+                "power_on": lambda: sg.wake_up(console_id),
+                "reboot": lambda: sg.reboot(console_id),
+                "mute": lambda: sg.mute(console_id),
+                "unmute": lambda: sg.unmute(console_id),
+                "volume_up": lambda: sg.volume(console_id, VolumeDirection.Up),
+                "volume_down": lambda: sg.volume(console_id, VolumeDirection.Down),
+                "play": lambda: sg.play(console_id),
+                "pause": lambda: sg.pause(console_id),
+                "go_home": lambda: sg.go_home(console_id),
+                "go_back": lambda: sg.go_back(console_id),
             }
 
             if command not in cmd_map:
@@ -609,17 +645,19 @@ class XboxClient:
         """Search the Xbox Store catalog."""
         xbl = await self._ensure_auth()
         try:
-            resp = await xbl.catalog.product_search(query, max_items=limit)
+            resp = await xbl.catalog.product_search(query, top=limit)
             products = []
             if resp and resp.results:
                 for r in resp.results[:limit]:
-                    item: dict[str, Any] = {
-                        "name": getattr(r, "title", "?"),
-                        "product_id": getattr(r, "product_id", ""),
-                    }
-                    if hasattr(r, "publisher_name"):
-                        item["publisher"] = r.publisher_name
-                    products.append(item)
+                    # Each search result nests title/product_id under products[].
+                    inner = (getattr(r, "products", None) or [None])[0]
+                    if inner is None:
+                        continue
+                    products.append({
+                        "name": getattr(inner, "title", "?"),
+                        "product_id": getattr(inner, "product_id", ""),
+                        "type": getattr(inner, "type", ""),
+                    })
             return products
         except XboxError:
             raise
@@ -630,8 +668,10 @@ class XboxClient:
         """Get detailed game info from the catalog."""
         xbl = await self._ensure_auth()
         try:
-            resp = await xbl.catalog.get_products(
-                [product_id], AlternateIdType.LEGACY_XBOX_PRODUCT_ID
+            # product_id here is a legacy Xbox product id, so resolve via the
+            # alternate-id endpoint (get_products expects catalog "big IDs").
+            resp = await xbl.catalog.get_product_from_alternate_id(
+                product_id, AlternateIdType.LEGACY_XBOX_PRODUCT_ID
             )
             if not resp or not resp.products:
                 raise NotFoundError(f"Product not found: {product_id}")
@@ -698,13 +738,17 @@ class XboxClient:
         """Get purchased/owned games list."""
         xbl = await self._ensure_auth()
         try:
-            resp = await xbl.lists.get_items(xbl.xuid, "XBLPins")
+            resp = await xbl.lists.get_items(str(xbl.xuid), "XBLPins")
             items = []
             if resp and hasattr(resp, "list_items"):
-                for item in resp.list_items[:limit]:
+                for li in resp.list_items[:limit]:
+                    # The pinned title lives under list_item.item.
+                    inner = getattr(li, "item", None)
+                    if inner is None:
+                        continue
                     items.append({
-                        "name": getattr(item, "title", "?"),
-                        "title_id": getattr(item, "item_id", ""),
+                        "name": getattr(inner, "title", "?"),
+                        "title_id": getattr(inner, "item_id", ""),
                     })
             return items
         except XboxError:
