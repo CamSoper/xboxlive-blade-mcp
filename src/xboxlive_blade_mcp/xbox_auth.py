@@ -103,10 +103,10 @@ async def authenticate() -> None:
             sys.exit(1)
 
         # Save tokens
+        from xboxlive_blade_mcp.token_store import save_tokens
+
         token_path = get_token_path()
-        token_path.parent.mkdir(parents=True, exist_ok=True)
-        token_path.write_text(auth_mgr.oauth.model_dump_json(indent=2))
-        token_path.chmod(0o600)
+        save_tokens(auth_mgr.oauth)
 
     print(f"\nTokens saved to {token_path}")
     print("Authentication complete! The MCP server can now connect to Xbox Live.")

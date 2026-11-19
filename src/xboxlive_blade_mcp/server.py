@@ -98,6 +98,51 @@ async def xbox_info() -> str:
         return _error(e)
 
 
+_device_flow = None
+
+
+@mcp.tool()
+async def xbox_auth_start() -> str:
+    """Start an Xbox Live sign-in when auth has failed. Returns a code: open the link, type the code, sign in to the Microsoft account. The server stores the tokens itself."""
+    global _device_flow  # noqa: PLW0603
+    import asyncio
+
+    from xboxlive_blade_mcp.token_store import DeviceFlow, RefreshError
+
+    try:
+        flow = await asyncio.to_thread(DeviceFlow.start)
+    except (RefreshError, Exception) as e:  # noqa: BLE001
+        return f"Error: could not start sign-in: {e}"
+    _device_flow = flow
+    flow.run_in_background()
+    minutes = max(1, int((flow.expires_at - __import__("time").time()) // 60))
+    return (
+        f"Open {flow.verification_uri} and enter code {flow.user_code}, then sign in "
+        f"with the Xbox account. The code works for about {minutes} minutes. "
+        "Call xbox_auth_status to confirm."
+    )
+
+
+@mcp.tool()
+async def xbox_auth_status() -> str:
+    """Check the sign-in started by xbox_auth_start, and the stored token's age."""
+    from xboxlive_blade_mcp.token_store import token_age
+
+    flow = _device_flow
+    parts = []
+    if flow is None:
+        parts.append("sign-in: none started")
+    else:
+        parts.append(f"sign-in: {flow.status}")
+        if flow.detail:
+            parts.append(flow.detail)
+        if flow.status == "done":
+            _get_client().reset_auth()
+    age = token_age()
+    parts.append("token: none" if age is None else f"token_age_hours={age.total_seconds() / 3600:.1f}")
+    return " | ".join(parts)
+
+
 # ===========================================================================
 # DOMAIN 2: PROFILE (2 tools) — contract: profile, search_users
 # ===========================================================================
@@ -464,10 +509,23 @@ async def xbox_friend_remove(
 def main() -> None:
     """Run the MCP server or auth subcommand."""
     if len(sys.argv) > 1 and sys.argv[1] == "auth":
+        if "--device" in sys.argv[2:]:
+            from xboxlive_blade_mcp.token_store import DeviceFlow
+
+            flow = DeviceFlow.start()
+            print(f"Open {flow.verification_uri} and enter code {flow.user_code}")
+            status = flow.wait()
+            print(f"Sign-in {status}. {flow.detail}".strip())
+            sys.exit(0 if status == "done" else 1)
         from xboxlive_blade_mcp.xbox_auth import run_auth
 
         run_auth()
         return
+
+    if os.environ.get("XBOX_KEEPALIVE", "true").lower() != "false":
+        from xboxlive_blade_mcp.token_store import start_keepalive
+
+        start_keepalive()
 
     if TRANSPORT == "http":
         from starlette.middleware import Middleware

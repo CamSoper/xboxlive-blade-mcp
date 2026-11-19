@@ -6,7 +6,6 @@ credential scrubbing, and typed exceptions.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -14,9 +13,13 @@ from xbox.webapi.api.client import XboxLiveClient
 from xbox.webapi.api.provider.catalog.models import AlternateIdType
 from xbox.webapi.api.provider.smartglass.models import VolumeDirection
 from xbox.webapi.authentication.manager import AuthenticationManager
-from xbox.webapi.authentication.models import OAuth2TokenResponse
 from xbox.webapi.common.signed_session import SignedSession
 
+from xboxlive_blade_mcp.token_store import (
+    PersistingAuthManager,
+    load_tokens,
+    save_tokens,
+)
 from xboxlive_blade_mcp.models import (
     get_client_id,
     get_client_secret,
@@ -81,29 +84,11 @@ def _classify_error(message: str) -> XboxError:
 
 
 # ---------------------------------------------------------------------------
-# Token persistence
+# Token persistence (see token_store.py for why this is careful)
 # ---------------------------------------------------------------------------
 
-
-def _load_tokens() -> OAuth2TokenResponse | None:
-    """Load cached OAuth tokens from disk."""
-    path = get_token_path()
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text())
-        return OAuth2TokenResponse(**data)
-    except Exception as e:
-        logger.warning("Failed to load tokens from %s: %s", path, e)
-        return None
-
-
-def _save_tokens(tokens: OAuth2TokenResponse) -> None:
-    """Save OAuth tokens to disk."""
-    path = get_token_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(tokens.model_dump_json(indent=2))
-    path.chmod(0o600)
+_load_tokens = load_tokens
+_save_tokens = save_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +117,7 @@ class XboxClient:
         client_secret = get_client_secret()
 
         self._session = SignedSession()
-        self._auth_mgr = AuthenticationManager(
+        self._auth_mgr = PersistingAuthManager(
             self._session, client_id, client_secret, REDIRECT_URI
         )
 
@@ -156,6 +141,12 @@ class XboxClient:
 
         self._xbl = XboxLiveClient(self._auth_mgr)
         return self._xbl
+
+    def reset_auth(self) -> None:
+        """Forget the in-memory session so the next call reloads tokens.json."""
+        self._xbl = None
+        self._auth_mgr = None
+        self._session = None
 
     @property
     def auth_manager(self) -> AuthenticationManager | None:
