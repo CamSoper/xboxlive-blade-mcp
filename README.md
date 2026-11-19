@@ -56,6 +56,10 @@ xboxlive-blade-mcp auth
 
 This opens a browser for Microsoft account login. Tokens are cached at `~/.xboxlive-blade-mcp/tokens.json` and auto-refresh on each use.
 
+On a headless server, use the device-code sign-in instead: `xboxlive-blade-mcp auth --device` (or call the `xbox_auth_start` tool) prints a code to type at https://www.microsoft.com/link. This needs **Allow public client flows = Yes** on the Azure app registration.
+
+Every token Microsoft returns is written to disk immediately (atomic write), and a background keep-alive refreshes the stored token every 12 hours (`XBOX_KEEPALIVE_SECONDS`; `XBOX_KEEPALIVE=false` turns it off), so the refresh token never ages out while the server is idle or long-running.
+
 ### 4. Run
 
 ```bash
